@@ -7,71 +7,84 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from flaskr.db import get_db
 
+import google_auth_oauthlib
+import requests
+import os
+from pip._vendor import cachecontrol
+import google.auth.transport.requests
+from google.oauth2 import id_token
+
+CLIENT_SECRETS_FILE = "client_secret.json"
+SCOPES = ["https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/userinfo.email", "openid"]
+GOOGLE_CLIENT_ID = "686310932762-ddndseck2m0kdajccc4v8gef51ahil5q.apps.googleusercontent.com"
+
+os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+
+# REDIRECT_URI = "http://127.0.0.1:5000/auth/oauth2callback"
+REDIRECT_URI = "http://cho0h5.iptime.org:5000/auth/oauth2callback"
+
+flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
+    CLIENT_SECRETS_FILE, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+
 bp = Blueprint('auth', __name__, url_prefix='/auth')
 
-@bp.route('/register', methods=('GET', 'POST'))
-def register():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        db = get_db()
-        error = None
+def register(google_id, user_id):
+    db = get_db()
+    
+    db.execute(
+        'INSERT INTO user (google_id, user_id) VALUES (?, ?)',
+        (google_id, user_id)
+    )
+    db.commit()
 
-        if not username:
-            error = 'Username is required.'
-        elif not password:
-            error = 'Password is required.'
-        elif db.execute(
-            'SELECT id FROM user WHERE username = ?', (username,)
-        ).fetchone() is not None:
-            error = 'User {} is already registered.'.format(username)
-        
-        if error is None:
-            db.execute(
-                'INSERT INTO user (username, password) VALUES (?, ?)',
-                (username, generate_password_hash(password))
-            )
-            db.commit()
-            return redirect(url_for('auth.login'))
-        
-        flash(error)
-
-    return render_template('auth/register.html')
-
-@bp.route('/login', methods=('GET', 'POST'))
+@bp.route('/login')
 def login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        db = get_db()
-        error = None
-        user = db.execute(
-            'SELECT * FROM user WHERE username = ?', (username,)
-        ).fetchone()
+    authorization_url, state = flow.authorization_url()
+    session["state"] = state
+    return redirect(authorization_url)
 
-        if user is None:
-            error = 'Incorrect username.'
-        elif not check_password_hash(user['password'], password):
-            error = 'Incorrect password.'
+@bp.route('/oauth2callback')
+def oauth2callback():
+    flow.fetch_token(authorization_response=request.url)
 
-        if error is None:
-            session.clear()
-            session['user_id'] = user['id']
-            return redirect(url_for('index'))
+    if not session["state"] == request.args["state"]:
+        abort(500)
 
-        flash(error)
+    credentials = flow.credentials
+    request_session = requests.session()
+    cached_session = cachecontrol.CacheControl(request_session)
+    token_request = google.auth.transport.requests.Request(session=cached_session)
 
-    return render_template('auth/login.html')
+    id_info = id_token.verify_oauth2_token(
+        id_token=credentials._id_token,
+        request=token_request,
+        audience=GOOGLE_CLIENT_ID
+    )
+
+    google_id = id_info.get("sub")
+    user_id = id_info.get("name")
+
+    db = get_db()
+    if db.execute(
+            'SELECT user_id FROM user WHERE google_id = ?', (google_id,)
+        ).fetchone() is None:
+        register(google_id, user_id)
+
+    session["google_id"] = google_id
+    session["user_id"] = user_id
+    
+    return redirect(url_for('index'))
+
 
 @bp.before_app_request
 def load_logged_in_user():
-    user_id = session.get('user_id')
+    google_id = session.get('google_id')
 
-    if user_id is None:
+    if google_id is None:
         g.user = None
     else:
         g.user = get_db().execute(
-            'SELECT * FROM user WHERE id = ?', (user_id,)
+            'SELECT * FROM user WHERE google_id = ?', (google_id,)
         ).fetchone()
 
 @bp.route('/logout')
